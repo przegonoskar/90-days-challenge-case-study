@@ -1,4 +1,4 @@
-# 90 Days Challenge — Engineering Case Study
+# 90 Days Challenge - Engineering Case Study
 
 > Pre-launch full-stack fitness platform built with an AI-assisted engineering workflow.
 
@@ -11,6 +11,15 @@ The product combines account and program-access management, onboarding, workout-
 I use this project as a real product-delivery environment rather than a standalone coding exercise: requirements evolve with the product, integrations have failure cases, and changes are reviewed against existing business rules, tests, and database state.
 
 The main application source repository remains private. This case study focuses on the product experience, architecture, engineering decisions, testing evidence and selected implementation boundaries without publishing the full commercial codebase.
+
+### At a Glance
+
+- **Role:** Co-Founder & Product Developer
+- **Stack:** Next.js, TypeScript, FastAPI, PostgreSQL
+- **Stage:** pre-launch commercial product
+- **Engineering focus:** payments, authentication, concurrency, backend-authoritative state
+- **Testing:** 566 backend tests and 194 frontend Vitest tests in the verified 2026-08-09 baseline
+- **Workflow:** AI-assisted implementation with explicit repository rules, review gates and regression testing
 
 ## Product
 
@@ -59,9 +68,9 @@ Fitti is intentionally separate from the FastAPI domain backend: its current Ope
 ```mermaid
 flowchart LR
     U[User / Browser]
-
-    FE[Next.js + TypeScript]
-    CHAT[Next.js /api/chatbot]
+    FE[Next.js frontend]
+    PROXY["Next.js rewrite<br/>/backend-api/* -> /api/*"]
+    CHAT["Next.js route<br/>POST /api/chatbot"]
 
     API[FastAPI]
     DB[(PostgreSQL)]
@@ -71,11 +80,12 @@ flowchart LR
 
     U --> FE
 
-    FE -->|Auth, onboarding, program access,<br/>checkout, workout APIs| API
+    FE -->|Authenticated product API requests| PROXY
+    PROXY --> API
     API --> DB
 
-    API -->|transaction/register<br/>transaction/verify| P24
-    P24 -->|payment webhook| API
+    API -->|POST /api/v1/transaction/register<br/>PUT /api/v1/transaction/verify| P24
+    P24 -->|Payment notification URL<br/>typically via /backend-api/*| PROXY
 
     FE --> CHAT
     CHAT --> OAI
@@ -95,8 +105,6 @@ flowchart LR
 ### Landing Page
 
 The public-facing landing page introduces the 90-day fitness program and provides access to the participant area.
-
-The product is still pre-launch, so the case study does not present placeholder marketing numbers as real traction or conversion data.
 
 ![90 Days Challenge landing page](assets/screenshots/landing.png)
 
@@ -158,7 +166,6 @@ Each checkout request includes an `Idempotency-Key`.
 
 The backend combines that key with a SHA-256 hash of the checkout intent:
 
-- operation
 - user
 - product
 - price
@@ -169,7 +176,7 @@ This allows the backend to distinguish two cases:
 
 **Same key, same intent**
 
-The existing canonical checkout result is replayed instead of creating another logical order.
+For an already registered canonical checkout, the existing checkout response is replayed without another Przelewy24 registration call.
 
 **Same key, different intent**
 
@@ -180,19 +187,39 @@ The pending local `Order` and `Payment` are persisted before the external Przele
 ```mermaid
 sequenceDiagram
     participant B as Browser
-    participant API as Checkout API
+    participant NX as Next.js Proxy
+    participant S as CheckoutService
     participant DB as PostgreSQL
     participant P24 as Przelewy24
 
-    B->>API: POST /checkout/orders + Idempotency-Key
-    API->>API: Validate key + hash request intent
-    API->>DB: Acquire bounded advisory lock
-    API->>DB: Create or replay Order / Payment
-    API->>DB: Commit pending local state
-    API->>P24: transaction/register
-    P24-->>API: registration result
-    API->>DB: Mark payment REGISTERED + commit
-    API-->>B: redirect_url
+    B->>NX: POST /backend-api/checkout/orders + CSRF + Idempotency-Key
+    NX->>S: POST /api/checkout/orders
+    S->>S: Hash user + product + price
+    S->>DB: pg_advisory_lock(user, key), lock_timeout=5s
+
+    alt Same key + different intent
+        S-->>NX: 409 IDEMPOTENCY_KEY_REUSED
+        NX-->>B: 409 Conflict
+    else Same key + same intent and already REGISTERED
+        S-->>NX: Replay canonical checkout response
+        NX-->>B: Existing checkout result
+    else New checkout
+        S->>DB: Insert Order + Payment(CREATED)
+        S->>DB: COMMIT
+        S->>P24: POST /api/v1/transaction/register
+
+        alt Registration failed or outcome uncertain
+            S->>DB: Payment = REGISTRATION_FAILED + COMMIT
+            S-->>NX: 503 uncertain / provider unavailable
+            NX-->>B: 503
+        else Registration succeeded
+            S->>DB: Payment = REGISTERED + COMMIT
+            S-->>NX: 201 + redirect_url
+            NX-->>B: 201 + redirect_url
+        end
+    end
+
+    S->>DB: pg_advisory_unlock (cleanup)
 ```
 
 ### Concurrency Control
@@ -211,33 +238,55 @@ Uncertain provider-registration outcomes are surfaced explicitly instead of pret
 
 ### Webhook Processing
 
-Przelewy24 payment confirmation arrives through a public webhook endpoint.
+Przelewy24 payment confirmation arrives through a public webhook endpoint, typically routed through the same-origin `/backend-api/*` rewrite to FastAPI.
 
 The backend:
 
-1. validates the incoming notification data and signature
-2. persists or re-reads the webhook event
-3. closes the current database transaction
-4. calls Przelewy24 `transaction/verify`
-5. performs a fresh locked read of the authoritative payment/order/event state
-6. applies the verified payment transition and program fulfillment atomically
+1. validates merchant/POS data and the notification signature
+2. validates the notification amount and currency against the authoritative payment
+3. reads or creates the `PaymentWebhookEvent`
+4. handles already processed events idempotently
+5. moves new processing toward `VERIFICATION_PENDING`
+6. closes the implicit database transaction before provider network I/O
+7. calls Przelewy24 `transaction/verify`
+8. performs a fresh `FOR UPDATE` read of the authoritative Payment, Order and webhook event
+9. applies payment/order transitions and program fulfillment atomically
 
 ```mermaid
 sequenceDiagram
     participant P24 as Przelewy24
-    participant API as Payment API
+    participant NX as Next.js Proxy
+    participant S as CheckoutService
+    participant A as P24 Adapter
     participant DB as PostgreSQL
+    participant E as EnrollmentService
 
-    P24->>API: POST payment notification
-    API->>DB: Persist / read webhook event
-    API->>DB: Close database transaction
-    API->>P24: transaction/verify
-    P24-->>API: verification result
-    API->>DB: Fresh locked Payment / Order / Event
-    API->>DB: VERIFIED + PAID
-    API->>DB: AccessGrant + Enrollment
-    API->>DB: Commit
-    API-->>P24: 200 OK
+    P24->>NX: POST /backend-api/payments/p24/notifications
+    NX->>S: POST /api/payments/p24/notifications
+
+    S->>S: Validate merchant/POS + signature
+    S->>DB: Validate amount/currency against Payment
+    S->>DB: Read/create PaymentWebhookEvent
+
+    alt Event already PROCESSED
+        S-->>NX: 200 OK
+        NX-->>P24: 200 OK
+    else New or unprocessed event
+        S->>DB: RECEIVED + Payment = VERIFICATION_PENDING
+        S->>DB: Close implicit transaction
+        S->>A: PUT /api/v1/transaction/verify
+        A-->>S: Verification result
+        Note over S,A: Provider verification is at-least-once
+
+        S->>DB: FOR UPDATE Payment + Order + Event
+        S->>E: fulfill_verified_order
+        E->>DB: AccessGrant + Enrollment
+        S->>DB: Payment = VERIFIED, Order = PAID, Event = PROCESSED
+        S->>DB: COMMIT
+
+        S-->>NX: 200 OK
+        NX-->>P24: 200 OK
+    end
 ```
 
 ### Transaction Boundaries
@@ -371,7 +420,7 @@ The project uses automated verification at several levels rather than relying on
 
 ### Backend
 
-At the latest full backend verification, the suite contained **566 passing tests**.
+Verified against application `main` at `723d3f6` on 2026-08-09, the backend suite contains **566 passing tests**.
 
 The suite covers areas including:
 
@@ -386,11 +435,13 @@ The suite covers areas including:
 
 For the concurrency-sensitive payment tests, I use a real PostgreSQL test database rather than replacing database locking behaviour with mocks.
 
+The backend baseline was reproduced in a CI-equivalent environment using Python 3.11, PostgreSQL 16, a clean test database and the current Alembic head (`20260808_0010`).
+
 ![566 passing backend tests](assets/evidence/backend-tests-566.png)
 
 ### Frontend
 
-At the latest full frontend verification, the Vitest suite contained **191 passing tests**.
+In the same verified 2026-08-09 application baseline, the frontend Vitest suite contains **194 passing tests**.
 
 Frontend verification also includes:
 
